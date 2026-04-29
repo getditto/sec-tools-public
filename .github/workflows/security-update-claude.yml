@@ -1,0 +1,196 @@
+# Reusable workflow: called by per-repo caller workflows.
+# Lives in getditto/.github (or any central repo).
+# See TINES_AUTOMATION.md for the full design.
+
+name: 'Security Dependency Update (Claude Code)'
+
+on:
+  workflow_dispatch:
+    inputs:
+      ecosystem:
+        description: 'Package ecosystem (npm, cargo, docker, go, python)'
+        required: true
+        type: string
+      alerts:
+        description: 'JSON array of {package, version, cve, manifest}'
+        required: true
+        type: string
+      linear_tickets:
+        description: 'Comma-separated Linear ticket IDs'
+        required: false
+        type: string
+      batch_id:
+        description: 'Unique batch identifier'
+        required: true
+        type: string
+      reviewers:
+        description: 'Comma-separated GitHub teams/users to request review from'
+        required: false
+        type: string
+        default: 'security-team'
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6.3.0
+        with:
+          node-version: 20
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Generate prompt
+        run: |
+          cat <<'EOF' > /tmp/security-prompt.txt
+          You are fixing multiple security vulnerabilities in a batch.
+
+          Ecosystem: ${{ inputs.ecosystem }}
+
+          Ensure the following are upgraded to at least the below version: (JSON array):
+          ${{ inputs.alerts }}
+
+          Instructions:
+          1. Fix ALL listed vulnerabilities together in minimal changes.
+          2. Find every manifest and lockfile affected in the repo.
+          3. Ecosystem-specific steps:
+             - npm: `npm install <pkg>@<version>` in each workspace, then `npm audit fix`.
+             - cargo: `cargo update <pkg>` for each package.
+             - docker: Update base image tags in Dockerfiles.
+             - go: `go get <pkg>@v<version>` then `go mod tidy`.
+             - python: Update in requirements.txt / pyproject.toml.
+          4. Run the appropriate build/lint check to verify nothing is broken:
+             - npm: `npm install && npm run build` (or equivalent)
+             - cargo: `cargo check`
+             - docker: `docker build` (dry run if possible)
+          5. If you cannot fix a specific package, skip it and write the package
+             name and reason to /tmp/skipped.json as a JSON array.
+          6. Do NOT commit. Leave the working tree dirty.
+          EOF
+
+      - name: Run Claude Code
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          claude --print \
+            --allowedTools "Edit,Read,Glob,Grep,Bash" \
+            --max-turns 100 \
+            "$(cat /tmp/security-prompt.txt)"
+
+      - name: Check for skipped packages
+        id: skipped
+        run: |
+          if [ -f /tmp/skipped.json ]; then
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Some packages could not be fixed automatically:"
+            cat /tmp/skipped.json
+          else
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create PR
+        if: ${{ !cancelled() }}
+        env:
+          # Use PAT instead of GITHUB_TOKEN so that PR creation triggers CI workflows
+          # (GITHUB_TOKEN blocks recursive workflow triggers by design)
+          GH_TOKEN: ${{ secrets.GH_TOKEN_SECURITY_PATCHES }}
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "::error::No changes made. Claude could not fix any of the listed vulnerabilities."
+            exit 1
+          fi
+
+          BRANCH="security/${{ inputs.batch_id }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add -u
+
+          # Capture untracked files left behind (not staged by git add -u)
+          UNTRACKED=$(git ls-files --others --exclude-standard)
+          UNTRACKED_NOTE=""
+          if [ -n "$UNTRACKED" ]; then
+            UNTRACKED_LIST=$(echo "$UNTRACKED" | sed 's/^/- `/' | sed 's/$/`/')
+            UNTRACKED_NOTE=$(cat <<UNTRACKED_EOF
+
+          ### Untracked files (not included in this PR)
+          The following files were created during the fix but were not part of the
+          original repo. Review manually if any are needed.
+          ${UNTRACKED_LIST}
+          UNTRACKED_EOF
+            )
+          fi
+
+          # Build summary from alerts JSON
+          ALERT_SUMMARY=$(echo '${{ inputs.alerts }}' | jq -r '.[] | "- **\(.package)** → \(.version) (\(.cve))"')
+
+          SKIPPED_NOTE=""
+          if [ -f /tmp/skipped.json ]; then
+            SKIPPED_NOTE=$(cat <<SKIP
+
+          ### Skipped (needs manual fix)
+          $(cat /tmp/skipped.json | jq -r '.[] | "- **\(.package)**: \(.reason)"')
+          SKIP
+          )
+          fi
+
+          git commit -m "$(cat <<COMMIT_EOF
+          [Security][${{ inputs.ecosystem }}] Fix dependency vulnerabilities
+
+          ${ALERT_SUMMARY}
+
+          Resolves: ${{ inputs.linear_tickets }}
+
+          Co-Authored-By: Claude <noreply@anthropic.com>
+          COMMIT_EOF
+          )"
+
+          git push -u origin "$BRANCH"
+
+          # Build reviewer flags: split comma-separated list into --reviewer flags
+          REVIEWER_FLAGS=""
+          IFS=',' read -ra REVIEWERS <<< "${{ inputs.reviewers }}"
+          for r in "${REVIEWERS[@]}"; do
+            REVIEWER_FLAGS="$REVIEWER_FLAGS --reviewer $(echo "$r" | xargs)"
+          done
+
+          PR_URL=$(gh pr create \
+            --title "Fix ${{ inputs.ecosystem }} security vulnerabilities" \
+            --body "$(cat <<PR_EOF
+          ## Summary
+
+          ${ALERT_SUMMARY}
+          ${SKIPPED_NOTE}
+          ${UNTRACKED_NOTE}
+
+          Resolves: ${{ inputs.linear_tickets }}
+
+          [Workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          > **Note:** Target versions are sourced from Tines and may not always
+          > reflect the latest or most appropriate release (e.g. a version may
+          > be deprecated upstream). Please verify that the resolved versions
+          > in lockfiles are suitable.
+
+          ## Test plan
+
+          - [ ] CI passes
+          - [ ] No new high/critical vulnerabilities in affected lockfiles
+          - [ ] Affected SDK/component builds successfully
+
+          Generated by Tines + Claude Code
+          PR_EOF
+          )" \
+            --label A-security --label D-skip-changelog --label K-automated-security-patch \
+            --reviewer "@copilot" \
+            $REVIEWER_FLAGS)
