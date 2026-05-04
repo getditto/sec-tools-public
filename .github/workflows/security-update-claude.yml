@@ -1,11 +1,11 @@
 # Reusable workflow: called by per-repo caller workflows.
-# Lives in getditto/.github (or any central repo).
+# Lives in getditto/sec-tools-public.
 # See TINES_AUTOMATION.md for the full design.
 
 name: 'Security Dependency Update (Claude Code)'
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       ecosystem:
         description: 'Package ecosystem (npm, cargo, docker, go, python)'
@@ -30,6 +30,8 @@ on:
         default: 'security-team'
     secrets:
       ANTHROPIC_API_KEY:
+        required: true
+      GH_TOKEN_SECURITY_PATCHES:
         required: true
 
 permissions:
