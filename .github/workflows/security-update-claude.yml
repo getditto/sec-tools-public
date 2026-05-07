@@ -85,9 +85,11 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           claude --print \
+            --output-format stream-json \
+            --verbose \
             --allowedTools "Edit,Read,Glob,Grep,Bash" \
             --max-turns 100 \
-            "$(cat /tmp/security-prompt.txt)"
+            "$(cat /tmp/security-prompt.txt)" | tee /tmp/claude-output.log
 
       - name: Check for skipped packages
         id: skipped
