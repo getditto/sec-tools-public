@@ -69,17 +69,39 @@ jobs:
 
           Instructions:
           1. Fix ALL listed vulnerabilities together in minimal changes.
+             Stay on the same major version as currently installed unless the
+             CVE fix requires otherwise.
           2. Find every manifest and lockfile affected in the repo.
-          3. Ecosystem-specific steps:
-             - npm: `npm install <pkg>@<version>` in each workspace, then `npm audit fix`.
+          3. Identify the package manager for each affected workspace:
+             - package-lock.json → npm
+             - yarn.lock with `__metadata` header → yarn berry (v3+)
+             - yarn.lock without `__metadata` → yarn classic (v1)
+             - Cargo.lock → cargo
+             Then run the appropriate upgrade command:
+             - npm: `npm install <pkg>@<version>` in each workspace, then
+               `npm audit fix`.
+             - yarn berry: `yarn up <pkg>@<version>` or
+               `yarn set resolution <pkg>@npm:* <version>` then `yarn install`.
+               Install yarn with `corepack enable` if needed.
+             - yarn classic: `yarn upgrade <pkg>@<version>` in each workspace.
              - cargo: `cargo update <pkg>` for each package.
              - docker: Update base image tags in Dockerfiles.
              - go: `go get <pkg>@v<version>` then `go mod tidy`.
              - python: Update in requirements.txt / pyproject.toml.
-          4. Run the appropriate build/lint check to verify nothing is broken:
-             - npm: `npm install && npm run build` (or equivalent)
-             - cargo: `cargo check`
+             IMPORTANT: Never hand-edit lockfiles (yarn.lock, package-lock.json,
+             Cargo.lock). Always use the package manager CLI. If the CLI is
+             unavailable, skip the package and add it to /tmp/skipped.json.
+          4. After all changes, verify EVERY affected workspace by running
+             the strict install command that CI uses:
+             - npm: `npm ci`
+             - yarn berry: `yarn install --immutable`
+             - yarn classic: `yarn install --frozen-lockfile`
+             - cargo: `cargo check --locked`
              - docker: `docker build` (dry run if possible)
+             If any strict command fails, the lockfile is inconsistent.
+             Fix it by running the non-strict install (e.g. `yarn install`,
+             `npm install`), then re-run the strict command to confirm.
+             Do NOT declare success until every workspace passes.
           5. If you cannot fix a specific package, skip it and write the package
              name and reason to /tmp/skipped.json as a JSON array.
           6. Do NOT commit. Leave the working tree dirty.
