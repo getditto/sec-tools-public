@@ -8,7 +8,7 @@ on:
   workflow_call:
     inputs:
       ecosystem:
-        description: 'Package ecosystem (npm, cargo, docker, go, python)'
+        description: 'Package ecosystem (npm, cargo, docker, go, python, maven, gradle)'
         required: true
         type: string
       alerts:
@@ -76,10 +76,16 @@ jobs:
              - docker: Update base image tags in Dockerfiles.
              - go: `go get <pkg>@v<version>` then `go mod tidy`.
              - python: Update in requirements.txt / pyproject.toml.
+             - maven: Edit pom.xml directly. Do NOT run mvn to verify.
+             - gradle: Edit .gradle files directly. Do NOT run gradlew or any
+               Gradle command to verify. Read back the edited file to confirm
+               the change looks correct, then exit. CI will validate the build.
           4. Run the appropriate build/lint check to verify nothing is broken:
              - npm: `npm install && npm run build` (or equivalent)
              - cargo: `cargo check`
              - docker: `docker build` (dry run if possible)
+             - maven: SKIP - do not run any build commands.
+             - gradle: SKIP - do not run any build commands.
           5. If you cannot fix a specific package, skip it and write the package
              name and reason to /tmp/skipped.json as a JSON array.
           6. Do NOT commit. Leave the working tree dirty.
@@ -95,6 +101,13 @@ jobs:
             --allowedTools "Edit,Read,Glob,Grep,Bash" \
             --max-turns 100 \
             "$(cat /tmp/security-prompt.txt)" | tee /tmp/claude-output.log
+
+      - name: Stop Gradle daemon
+        if: always()
+        run: |
+          if [ -f gradlew ]; then
+            ./gradlew --stop || true
+          fi
 
       - name: Check for skipped packages
         id: skipped
