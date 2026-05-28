@@ -299,11 +299,12 @@ jobs:
               packages = []
               pins = data.get("pins", data.get("object", {}).get("pins", []))
               for pin in pins:
-                  name = pin.get("identity") or pin.get("package", "")
+                  location = pin.get("location", pin.get("repositoryURL", ""))
                   state = pin.get("state", {})
                   ver = state.get("version") or state.get("revision", "")
-                  if name and ver:
-                      packages.append((name.lower(), ver))
+                  if location and ver:
+                      loc = re.sub(r"^https?://", "", location).rstrip("/").removesuffix(".git")
+                      packages.append((loc, ver))
               return packages
 
           def parse_actions_yaml(path):
