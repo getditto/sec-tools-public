@@ -33,6 +33,10 @@ on:
         required: false
         type: string
         default: ''
+      target_branch:
+        description: 'Target branch for checkout and PR base (default: dispatch ref)'
+        required: false
+        type: string
     secrets:
       ANTHROPIC_API_KEY:
         required: true
@@ -49,6 +53,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.target_branch || github.ref }}
 
       - uses: actions/setup-node@v6.3.0
         with:
@@ -132,7 +138,8 @@ jobs:
             exit 1
           fi
 
-          BRANCH="security/${{ inputs.batch_id }}"
+          TARGET="${{ inputs.target_branch || github.ref_name }}"
+          BRANCH="security/${{ inputs.batch_id }}-$(echo "$TARGET" | sed 's|/|-|g')"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
@@ -196,6 +203,7 @@ jobs:
           fi
 
           PR_URL=$(gh pr create \
+            --base "$TARGET" \
             --title "Fix ${{ inputs.ecosystem }} security vulnerabilities" \
             --body "$(cat <<PR_EOF
           ## Summary

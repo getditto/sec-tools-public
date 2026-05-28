@@ -1,0 +1,444 @@
+# Reusable workflow: submit dependency snapshots for non-default branches.
+# Lives in getditto/sec-tools-public.
+#
+# GitHub only generates Dependabot alerts for the default branch's dependency
+# graph. This workflow works around that by checking out a target branch,
+# parsing all lockfiles/manifests, and submitting a dependency snapshot with
+# ref/sha pointing to main (so GitHub processes it). Manifest paths are
+# prefixed with "@branch=<branch>::" so downstream consumers can identify
+# which branch each alert belongs to.
+#
+# See: https://docs.github.com/en/rest/dependency-graph/dependency-submission
+# Context: https://github.com/dependabot/dependabot-core/issues/2767
+
+name: "Dependency Submission (Non-Default Branch)"
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: "Branch to scan for dependencies"
+        required: true
+        type: string
+      exclude_dirs:
+        description: "Comma-separated directory names to exclude from scanning"
+        required: false
+        type: string
+        default: "node_modules,.git,.yarn"
+
+permissions:
+  contents: write
+
+jobs:
+  submit-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 1
+
+      - name: Get main branch SHA
+        id: main-sha
+        run: |
+          git fetch origin main --depth=1
+          echo "sha=$(git rev-parse origin/main)" >> "$GITHUB_OUTPUT"
+
+      - name: Submit dependency snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: ${{ inputs.branch }}
+          EXCLUDE_DIRS: ${{ inputs.exclude_dirs }}
+          MAIN_SHA: ${{ steps.main-sha.outputs.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+        run: |
+          python3 << 'PYEOF'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          EXCLUDE_DIRS = set(
+              d.strip() for d in os.environ.get("EXCLUDE_DIRS", "").split(",") if d.strip()
+          )
+
+          def should_skip(path):
+              return bool(EXCLUDE_DIRS & set(Path(path).parts))
+
+          def make_purl(name, ecosystem):
+              PURL_TYPE = {
+                  "cargo": "cargo", "npm": "npm", "yarn": "npm",
+                  "pnpm": "npm", "go": "golang", "pip": "pypi",
+                  "poetry": "pypi", "gem": "gem", "composer": "composer",
+                  "nuget": "nuget", "pub": "pub", "swift": "swift",
+                  "actions": "githubactions",
+              }
+              ptype = PURL_TYPE.get(ecosystem, ecosystem)
+              if ptype == "npm" and name.startswith("@"):
+                  return f"pkg:{ptype}/%40{name[1:]}"
+              return f"pkg:{ptype}/{name}"
+
+          def build_manifest(rel_path, packages, ecosystem):
+              resolved = {}
+              for name, version in packages:
+                  purl = f"{make_purl(name, ecosystem)}@{version}"
+                  resolved[purl] = {
+                      "package_url": purl,
+                      "relationship": "indirect",
+                      "scope": "runtime",
+                  }
+              return {
+                  "name": rel_path,
+                  "file": {"source_location": rel_path},
+                  "resolved": resolved,
+              }
+
+          # --- Parsers for every ecosystem the Dependency Graph supports ---
+
+          def parse_cargo_lock(path):
+              content = path.read_text()
+              packages = []
+              current = {}
+              for line in content.splitlines():
+                  line = line.strip()
+                  if line == "[[package]]":
+                      if (current.get("name") and current.get("version")
+                              and "registry" in current.get("source", "")):
+                          packages.append((current["name"], current["version"]))
+                      current = {}
+                  elif "=" in line:
+                      key, _, value = line.partition("=")
+                      current[key.strip()] = value.strip().strip('"')
+              if (current.get("name") and current.get("version")
+                      and "registry" in current.get("source", "")):
+                  packages.append((current["name"], current["version"]))
+              return packages
+
+          def parse_package_lock(path):
+              data = json.loads(path.read_text())
+              packages = []
+              lock_version = data.get("lockfileVersion", 1)
+              if lock_version >= 2:
+                  for key, info in data.get("packages", {}).items():
+                      if not key:
+                          continue
+                      parts = key.split("node_modules/")
+                      name = parts[-1] if parts else key
+                      version = info.get("version")
+                      if name and version:
+                          packages.append((name, version))
+              else:
+                  for name, info in data.get("dependencies", {}).items():
+                      version = info.get("version")
+                      if name and version:
+                          packages.append((name, version))
+              return packages
+
+          def parse_yarn_lock(path):
+              content = path.read_text()
+              packages = []
+              current_name = None
+              for line in content.splitlines():
+                  if not line.startswith(" ") and line.endswith(":"):
+                      key = line.rstrip(":")
+                      parts = key.strip('"').split(",")
+                      first = parts[0].strip().strip('"')
+                      at = first.rfind("@")
+                      if at > 0:
+                          current_name = first[:at]
+                  elif line.strip().startswith("version") and current_name:
+                      m = re.match(r'\s+version:?\s+"?([^"]+)"?', line)
+                      if m:
+                          packages.append((current_name, m.group(1)))
+                      current_name = None
+              return packages
+
+          def parse_pnpm_lock(path):
+              content = path.read_text()
+              packages = []
+              in_packages = False
+              for line in content.splitlines():
+                  if line.startswith("packages:"):
+                      in_packages = True
+                      continue
+                  if in_packages and not line.startswith(" ") and line.strip():
+                      in_packages = False
+                  if in_packages:
+                      m = re.match(r"\s+'?/?([^@'\s]+)@([^:'(\s]+)", line)
+                      if m:
+                          packages.append((m.group(1), m.group(2)))
+              return packages
+
+          def parse_go_mod(path):
+              content = path.read_text()
+              packages = []
+              in_require = False
+              for line in content.splitlines():
+                  line = line.strip()
+                  if line == "require (":
+                      in_require = True
+                      continue
+                  if line == ")":
+                      in_require = False
+                      continue
+                  if in_require and not line.startswith("//"):
+                      parts = line.split()
+                      if len(parts) >= 2:
+                          packages.append((parts[0], parts[1].lstrip("v")))
+                  elif line.startswith("require ") and not line.startswith("require ("):
+                      parts = line.split()
+                      if len(parts) >= 3:
+                          packages.append((parts[1], parts[2].lstrip("v")))
+              return packages
+
+          def parse_requirements_txt(path):
+              packages = []
+              for line in path.read_text().splitlines():
+                  line = line.strip()
+                  if not line or line.startswith("#") or line.startswith("-"):
+                      continue
+                  m = re.match(r"([A-Za-z0-9_.-]+)\s*==\s*([^\s;#]+)", line)
+                  if m:
+                      packages.append((m.group(1).lower(), m.group(2)))
+              return packages
+
+          def parse_pipfile_lock(path):
+              data = json.loads(path.read_text())
+              packages = []
+              for section in ("default", "develop"):
+                  for name, info in data.get(section, {}).items():
+                      ver = info.get("version", "").lstrip("=")
+                      if ver:
+                          packages.append((name.lower(), ver))
+              return packages
+
+          def parse_poetry_lock(path):
+              content = path.read_text()
+              packages = []
+              current = {}
+              for line in content.splitlines():
+                  line = line.strip()
+                  if line == "[[package]]":
+                      if current.get("name") and current.get("version"):
+                          packages.append((current["name"].lower(), current["version"]))
+                      current = {}
+                  elif "=" in line and not line.startswith("["):
+                      key, _, value = line.partition("=")
+                      current[key.strip()] = value.strip().strip('"')
+              if current.get("name") and current.get("version"):
+                  packages.append((current["name"].lower(), current["version"]))
+              return packages
+
+          def parse_gemfile_lock(path):
+              content = path.read_text()
+              packages = []
+              in_specs = False
+              for line in content.splitlines():
+                  if line.strip() == "specs:":
+                      in_specs = True
+                      continue
+                  if in_specs:
+                      if not line.startswith(" "):
+                          in_specs = False
+                          continue
+                      m = re.match(r"\s{4}(\S+)\s+\(([^)]+)\)", line)
+                      if m:
+                          packages.append((m.group(1), m.group(2)))
+              return packages
+
+          def parse_composer_lock(path):
+              data = json.loads(path.read_text())
+              packages = []
+              for pkg in data.get("packages", []) + data.get("packages-dev", []):
+                  name = pkg.get("name")
+                  ver = pkg.get("version", "").lstrip("v")
+                  if name and ver:
+                      packages.append((name, ver))
+              return packages
+
+          def parse_csproj(path):
+              packages = []
+              try:
+                  tree = ET.parse(path)
+                  for ref in tree.iter():
+                      if ref.tag.endswith("PackageReference") or ref.tag == "PackageReference":
+                          name = ref.get("Include") or ref.get("include")
+                          ver = ref.get("Version") or ref.get("version")
+                          if name and ver and not ver.startswith("$"):
+                              packages.append((name, ver))
+              except ET.ParseError:
+                  pass
+              return packages
+
+          def parse_pubspec_lock(path):
+              content = path.read_text()
+              packages = []
+              current_name = None
+              for line in content.splitlines():
+                  m = re.match(r"  (\S+):$", line)
+                  if m:
+                      current_name = m.group(1)
+                      continue
+                  if current_name:
+                      m = re.match(r'\s+version:\s+"?([^"]+)"?', line)
+                      if m:
+                          packages.append((current_name, m.group(1)))
+                          current_name = None
+                      elif not line.startswith("    "):
+                          current_name = None
+              return packages
+
+          def parse_package_resolved(path):
+              data = json.loads(path.read_text())
+              packages = []
+              pins = data.get("pins", data.get("object", {}).get("pins", []))
+              for pin in pins:
+                  name = pin.get("identity") or pin.get("package", "")
+                  state = pin.get("state", {})
+                  ver = state.get("version") or state.get("revision", "")
+                  if name and ver:
+                      packages.append((name.lower(), ver))
+              return packages
+
+          def parse_actions_yaml(path):
+              packages = []
+              for line in path.read_text().splitlines():
+                  m = re.match(r"\s*-?\s*uses:\s*([^@\s]+)@([^\s#]+)", line)
+                  if m:
+                      action = m.group(1)
+                      ver = m.group(2)
+                      if not action.startswith("."):
+                          packages.append((action, ver))
+              return packages
+
+          # --- Scanning ---
+
+          SCANNERS = [
+              ("Cargo.lock",         "cargo",    parse_cargo_lock),
+              ("package-lock.json",  "npm",      parse_package_lock),
+              ("yarn.lock",          "yarn",     parse_yarn_lock),
+              ("pnpm-lock.yaml",     "pnpm",     parse_pnpm_lock),
+              ("go.mod",             "go",       parse_go_mod),
+              ("requirements.txt",   "pip",      parse_requirements_txt),
+              ("Pipfile.lock",       "pip",      parse_pipfile_lock),
+              ("poetry.lock",        "poetry",   parse_poetry_lock),
+              ("Gemfile.lock",       "gem",      parse_gemfile_lock),
+              ("composer.lock",      "composer", parse_composer_lock),
+              ("pubspec.lock",       "pub",      parse_pubspec_lock),
+              ("Package.resolved",   "swift",    parse_package_resolved),
+          ]
+
+          CSPROJ_EXTS = {".csproj", ".vbproj", ".nuspec", ".vcxproj", ".fsproj"}
+
+          def main():
+              branch = os.environ["TARGET_BRANCH"]
+              repo = os.environ["GITHUB_REPOSITORY"]
+              run_id = os.environ["GITHUB_RUN_ID"]
+              server = os.environ["GITHUB_SERVER_URL"]
+              main_sha = os.environ["MAIN_SHA"]
+              prefix = f"@branch={branch}::"
+              correlator = f"dep-submission-{branch.replace('/', '-')}"
+
+              manifests = {}
+
+              for filename, ecosystem, parser in SCANNERS:
+                  for found in sorted(Path(".").rglob(filename)):
+                      rel = str(found)
+                      if should_skip(rel):
+                          continue
+                      try:
+                          pkgs = parser(found)
+                          if pkgs:
+                              tagged = f"{prefix}{rel}"
+                              manifests[tagged] = build_manifest(tagged, pkgs, ecosystem)
+                              print(f"  {rel}: {len(pkgs)} {ecosystem} packages", file=sys.stderr)
+                      except Exception as exc:
+                          print(f"  Warning: {rel}: {exc}", file=sys.stderr)
+
+              for ext in CSPROJ_EXTS:
+                  for found in sorted(Path(".").rglob(f"*{ext}")):
+                      rel = str(found)
+                      if should_skip(rel):
+                          continue
+                      try:
+                          pkgs = parse_csproj(found)
+                          if pkgs:
+                              tagged = f"{prefix}{rel}"
+                              manifests[tagged] = build_manifest(tagged, pkgs, "nuget")
+                              print(f"  {rel}: {len(pkgs)} nuget packages", file=sys.stderr)
+                      except Exception as exc:
+                          print(f"  Warning: {rel}: {exc}", file=sys.stderr)
+
+              actions_dir = Path(".github/workflows")
+              if actions_dir.is_dir():
+                  for yml in sorted(actions_dir.glob("*.yml")) + sorted(actions_dir.glob("*.yaml")):
+                      rel = str(yml)
+                      try:
+                          pkgs = parse_actions_yaml(yml)
+                          if pkgs:
+                              tagged = f"{prefix}{rel}"
+                              manifests[tagged] = build_manifest(tagged, pkgs, "actions")
+                              print(f"  {rel}: {len(pkgs)} actions refs", file=sys.stderr)
+                      except Exception as exc:
+                          print(f"  Warning: {rel}: {exc}", file=sys.stderr)
+
+              if not manifests:
+                  print("No lockfiles found — nothing to submit.", file=sys.stderr)
+                  sys.exit(0)
+
+              snapshot = {
+                  "version": 0,
+                  "sha": main_sha,
+                  "ref": "refs/heads/main",
+                  "job": {
+                      "id": run_id,
+                      "correlator": correlator,
+                      "html_url": f"{server}/{repo}/actions/runs/{run_id}",
+                  },
+                  "detector": {
+                      "name": "sec-tools-dep-submission",
+                      "version": "1.0.0",
+                      "url": "https://github.com/getditto/sec-tools-public",
+                  },
+                  "scanned": datetime.now(timezone.utc).isoformat(),
+                  "manifests": manifests,
+              }
+
+              snapshot_file = "/tmp/snapshot.json"
+              with open(snapshot_file, "w") as f:
+                  json.dump(snapshot, f)
+
+              size_mb = os.path.getsize(snapshot_file) / (1024 * 1024)
+              total_pkgs = sum(len(m["resolved"]) for m in manifests.values())
+              print(
+                  f"\nSnapshot: {len(manifests)} manifests, "
+                  f"{total_pkgs} packages, {size_mb:.2f} MB",
+                  file=sys.stderr,
+              )
+
+              result = subprocess.run(
+                  [
+                      "gh", "api", "--method", "POST",
+                      f"/repos/{repo}/dependency-graph/snapshots",
+                      "--input", snapshot_file,
+                  ],
+                  capture_output=True,
+                  text=True,
+              )
+
+              if result.returncode != 0:
+                  print(f"API error: {result.stderr}", file=sys.stderr)
+                  print(result.stdout, file=sys.stderr)
+                  sys.exit(1)
+
+              print(f"Submitted: {result.stdout.strip()}", file=sys.stderr)
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
