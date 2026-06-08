@@ -51,6 +51,8 @@ jobs:
   generate-security-update-pr:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      pr_number: ${{ steps.create-pr.outputs.pr_number }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -128,6 +130,7 @@ jobs:
           fi
 
       - name: Create PR
+        id: create-pr
         if: ${{ !cancelled() }}
         env:
           # Use PAT instead of GITHUB_TOKEN so that PR creation triggers CI workflows
@@ -234,3 +237,7 @@ jobs:
             --reviewer "@copilot" \
             $LABEL_FLAGS \
             $REVIEWER_FLAGS)
+
+          PR_NUM=$(echo "$PR_URL" | grep -oP '\d+$')
+          echo "pr_number=$PR_NUM" >> "$GITHUB_OUTPUT"
+          echo "Created PR: $PR_URL (#$PR_NUM)"
