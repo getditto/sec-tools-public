@@ -79,25 +79,50 @@ jobs:
           Instructions:
           1. Fix ALL listed vulnerabilities together in minimal changes.
           2. Find every manifest and lockfile affected in the repo.
-          3. Ecosystem-specific steps:
-             - npm: `npm install <pkg>@<version>` in each workspace, then `npm audit fix`.
-             - cargo: `cargo update <pkg>` for each package.
+          3. The fix must not change any package's public dependency surface:
+             do not add new direct dependencies, do not move packages between
+             dependencies and devDependencies (or the ecosystem equivalent),
+             and do not change the project's own version field.
+          4. Before changing anything, determine how each vulnerable package
+             enters the dependency graph (direct vs transitive), and look at
+             how previous security pins were done in the same manifest (e.g.
+             an existing overrides block) — match that pattern.
+          5. Ecosystem-specific steps:
+             - npm: For each package, run `npm ls <pkg>` to see how it enters
+               the graph.
+               * Direct dependency: bump the version range in place, in the
+                 section it already lives in (dependencies vs devDependencies).
+               * Transitive only: pin it via the "overrides" field in
+                 package.json, then run `npm install` to refresh the lockfile.
+                 Do NOT run `npm install <pkg>@<version>` for transitive
+                 packages — that promotes them to direct runtime dependencies.
+               Avoid `npm audit fix` unless the targeted fix fails; it can
+               make broad unrelated changes.
+             - cargo: Prefer `cargo update -p <pkg> --precise <version>`
+               (lockfile-only). Only edit Cargo.toml when the package is a
+               direct dependency whose version requirement blocks the fix.
              - docker: Update base image tags in Dockerfiles.
-             - go: `go get <pkg>@v<version>` then `go mod tidy`.
+             - go: `go get <pkg>@v<version>` then `go mod tidy`. Keep indirect
+               dependencies indirect — do not add new direct requirements to
+               go.mod.
              - python: Update in requirements.txt / pyproject.toml.
              - maven: Edit pom.xml directly. Do NOT run mvn to verify.
              - gradle: Edit .gradle files directly. Do NOT run gradlew or any
                Gradle command to verify. Read back the edited file to confirm
                the change looks correct, then exit. CI will validate the build.
-          4. Run the appropriate build/lint check to verify nothing is broken:
+          6. Run the appropriate build/lint check to verify nothing is broken:
              - npm: `npm install && npm run build` (or equivalent)
              - cargo: `cargo check`
              - docker: `docker build` (dry run if possible)
              - maven: SKIP - do not run any build commands.
              - gradle: SKIP - do not run any build commands.
-          5. If you cannot fix a specific package, skip it and write the package
+          7. Self-review before exiting: run `git diff` on every changed
+             manifest and confirm the only changes are the intended version
+             bumps or overrides — revert anything unrelated. Confirm the
+             resolved version meets the target (e.g. `npm ls <pkg>`).
+          8. If you cannot fix a specific package, skip it and write the package
              name and reason to /tmp/skipped.json as a JSON array.
-          6. Do NOT commit. Leave the working tree dirty.
+          9. Do NOT commit. Leave the working tree dirty.
           EOF
 
       - name: Run Claude Code
