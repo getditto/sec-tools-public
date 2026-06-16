@@ -207,7 +207,7 @@ jobs:
 
           ${ALERT_SUMMARY}
 
-          Resolves: ${{ inputs.linear_tickets }}
+          Refs: ${{ inputs.linear_tickets }}
 
           Co-Authored-By: Claude <noreply@anthropic.com>
           COMMIT_EOF
@@ -241,7 +241,7 @@ jobs:
           ${SKIPPED_NOTE}
           ${UNTRACKED_NOTE}
 
-          Resolves: ${{ inputs.linear_tickets }}
+          Refs: ${{ inputs.linear_tickets }}
 
           [Workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
