@@ -1,0 +1,267 @@
+# Reusable workflow: called by per-repo caller workflows.
+# Lives in getditto/sec-tools-public.
+# See TINES_AUTOMATION.md for the full design.
+
+name: 'Security Dependency Update (OpenAI Codex)'
+
+on:
+  workflow_call:
+    inputs:
+      ecosystem:
+        description: 'Package ecosystem (npm, cargo, docker, go, python, maven, gradle)'
+        required: true
+        type: string
+      alerts:
+        description: 'JSON array of {package, version, cve, manifest}'
+        required: true
+        type: string
+      linear_tickets:
+        description: 'Comma-separated Linear ticket IDs'
+        required: false
+        type: string
+      batch_id:
+        description: 'Unique batch identifier'
+        required: true
+        type: string
+      reviewers:
+        description: 'Comma-separated GitHub teams/users to request review from'
+        required: false
+        type: string
+        default: 'security-team'
+      pr_labels:
+        description: 'Comma-separated PR labels'
+        required: false
+        type: string
+        default: ''
+      target_branch:
+        description: 'Target branch for checkout and PR base (default: dispatch ref)'
+        required: false
+        type: string
+    secrets:
+      SEC_OPENAI_KEY:
+        required: true
+      GH_TOKEN_SECURITY_PATCHES:
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  generate-security-update-pr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      pr_number: ${{ steps.create-pr.outputs.pr_number }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.target_branch || github.ref }}
+          token: ${{ secrets.GH_TOKEN_SECURITY_PATCHES }}
+
+      - uses: actions/setup-node@v6.3.0
+        with:
+          node-version: 20
+
+      - name: Install OpenAI Codex
+        run: npm install -g @openai/codex
+
+      - name: Generate prompt
+        run: |
+          cat <<'EOF' > /tmp/security-prompt.txt
+          You are fixing multiple security vulnerabilities in a batch.
+
+          Ecosystem: ${{ inputs.ecosystem }}
+
+          Ensure the following are upgraded to at least the below version: (JSON array):
+          ${{ inputs.alerts }}
+
+          Instructions:
+          1. Fix ALL listed vulnerabilities together in minimal changes.
+          2. Find every manifest and lockfile affected in the repo.
+          3. The fix must not change any package's public dependency surface:
+             do not add new direct dependencies, do not move packages between
+             dependencies and devDependencies (or the ecosystem equivalent),
+             and do not change the project's own version field.
+          4. Before changing anything, determine how each vulnerable package
+             enters the dependency graph (direct vs transitive), and look at
+             how previous security pins were done in the same manifest (e.g.
+             an existing overrides block) — match that pattern.
+          5. Ecosystem-specific steps:
+             - npm: For each package, run `npm ls <pkg>` to see how it enters
+               the graph.
+               * Direct dependency: bump the version range in place, in the
+                 section it already lives in (dependencies vs devDependencies).
+               * Transitive only: pin it via the "overrides" field in
+                 package.json, then run `npm install` to refresh the lockfile.
+                 Do NOT run `npm install <pkg>@<version>` for transitive
+                 packages — that promotes them to direct runtime dependencies.
+               Avoid `npm audit fix` unless the targeted fix fails; it can
+               make broad unrelated changes.
+             - cargo: Prefer `cargo update -p <pkg> --precise <version>`
+               (lockfile-only). Only edit Cargo.toml when the package is a
+               direct dependency whose version requirement blocks the fix.
+             - docker: Update base image tags in Dockerfiles.
+             - go: `go get <pkg>@v<version>` then `go mod tidy`. Keep indirect
+               dependencies indirect — do not add new direct requirements to
+               go.mod.
+             - python: Update in requirements.txt / pyproject.toml.
+             - maven: Edit pom.xml directly. Do NOT run mvn to verify.
+             - gradle: Edit .gradle files directly. Do NOT run gradlew or any
+               Gradle command to verify. Read back the edited file to confirm
+               the change looks correct, then exit. CI will validate the build.
+          6. Run the appropriate build/lint check to verify nothing is broken:
+             - npm: `npm install && npm run build` (or equivalent)
+             - cargo: `cargo check`
+             - docker: `docker build` (dry run if possible)
+             - maven: SKIP - do not run any build commands.
+             - gradle: SKIP - do not run any build commands.
+          7. Self-review before exiting: run `git diff` on every changed
+             manifest and confirm the only changes are the intended version
+             bumps or overrides — revert anything unrelated. Confirm the
+             resolved version meets the target (e.g. `npm ls <pkg>`).
+          8. If you cannot fix a specific package, skip it and write the package
+             name and reason to /tmp/skipped.json as a JSON array.
+          9. Do NOT commit. Leave the working tree dirty.
+          EOF
+
+      - name: Run OpenAI Codex
+        env:
+          CODEX_API_KEY: ${{ secrets.SEC_OPENAI_KEY }}
+        run: |
+          codex --ask-for-approval never exec \
+            --sandbox workspace-write \
+            -c 'sandbox_workspace_write.network_access=true' \
+            --json \
+            "$(cat /tmp/security-prompt.txt)" | tee /tmp/codex-output.jsonl
+
+      - name: Stop Gradle daemon
+        if: always()
+        run: |
+          if [ -f gradlew ]; then
+            ./gradlew --stop || true
+          fi
+
+      - name: Check for skipped packages
+        id: skipped
+        run: |
+          if [ -f /tmp/skipped.json ]; then
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Some packages could not be fixed automatically:"
+            cat /tmp/skipped.json
+          else
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create PR
+        id: create-pr
+        if: ${{ !cancelled() }}
+        env:
+          # Use PAT instead of GITHUB_TOKEN so that PR creation triggers CI workflows
+          # (GITHUB_TOKEN blocks recursive workflow triggers by design)
+          GH_TOKEN: ${{ secrets.GH_TOKEN_SECURITY_PATCHES }}
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "::error::No changes made. OpenAI Codex could not fix any of the listed vulnerabilities."
+            exit 1
+          fi
+
+          TARGET="${{ inputs.target_branch || github.ref_name }}"
+          BRANCH="security/${{ inputs.batch_id }}-$(echo "$TARGET" | sed 's|/|-|g')"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add -u
+
+          # Capture untracked files left behind (not staged by git add -u)
+          UNTRACKED=$(git ls-files --others --exclude-standard)
+          UNTRACKED_NOTE=""
+          if [ -n "$UNTRACKED" ]; then
+            UNTRACKED_LIST=$(echo "$UNTRACKED" | sed 's/^/- `/' | sed 's/$/`/')
+            UNTRACKED_NOTE=$(cat <<UNTRACKED_EOF
+
+          ### Untracked files (not included in this PR)
+          The following files were created during the fix but were not part of the
+          original repo. Review manually if any are needed.
+          ${UNTRACKED_LIST}
+          UNTRACKED_EOF
+            )
+          fi
+
+          # Build summary from alerts JSON
+          ALERT_SUMMARY=$(echo '${{ inputs.alerts }}' | jq -r '.[] | "- **\(.package)** → \(.version) (\(.cve))"')
+
+          SKIPPED_NOTE=""
+          if [ -f /tmp/skipped.json ]; then
+            SKIPPED_NOTE=$(cat <<SKIP
+
+          ### Skipped (needs manual fix)
+          $(cat /tmp/skipped.json | jq -r '.[] | "- **\(.package)**: \(.reason)"')
+          SKIP
+          )
+          fi
+
+          git commit -m "$(cat <<COMMIT_EOF
+          [Security][${{ inputs.ecosystem }}] Fix dependency vulnerabilities
+
+          ${ALERT_SUMMARY}
+
+          Refs: ${{ inputs.linear_tickets }}
+
+          Co-Authored-By: OpenAI Codex <noreply@openai.com>
+          COMMIT_EOF
+          )"
+
+          git push -u origin "$BRANCH"
+
+          # Build reviewer flags: split comma-separated list into --reviewer flags
+          REVIEWER_FLAGS=""
+          IFS=',' read -ra REVIEWERS <<< "${{ inputs.reviewers }}"
+          for r in "${REVIEWERS[@]}"; do
+            REVIEWER_FLAGS="$REVIEWER_FLAGS --reviewer $(echo "$r" | xargs)"
+          done
+
+          # Build label flags from caller-provided labels
+          LABEL_FLAGS=""
+          if [ -n "${{ inputs.pr_labels }}" ]; then
+            IFS=',' read -ra LABELS <<< "${{ inputs.pr_labels }}"
+            for l in "${LABELS[@]}"; do
+              LABEL_FLAGS="$LABEL_FLAGS --label $(echo "$l" | xargs)"
+            done
+          fi
+
+          PR_URL=$(gh pr create \
+            --base "$TARGET" \
+            --title "Fix ${{ inputs.ecosystem }} security vulnerabilities" \
+            --body "$(cat <<PR_EOF
+          ## Summary
+
+          ${ALERT_SUMMARY}
+          ${SKIPPED_NOTE}
+          ${UNTRACKED_NOTE}
+
+          Refs: ${{ inputs.linear_tickets }}
+
+          [Workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          > **Note:** Target versions are sourced from Tines and may not always
+          > reflect the latest or most appropriate release (e.g. a version may
+          > be deprecated upstream). Please verify that the resolved versions
+          > in lockfiles are suitable.
+
+          ## Test plan
+
+          - [ ] CI passes
+          - [ ] No new high/critical vulnerabilities in affected lockfiles
+          - [ ] Affected SDK/component builds successfully
+
+          Generated by Tines + OpenAI Codex
+          PR_EOF
+          )" \
+            --reviewer "@copilot" \
+            $LABEL_FLAGS \
+            $REVIEWER_FLAGS)
+
+          PR_NUM=$(echo "$PR_URL" | grep -oP '\d+$')
+          echo "pr_number=$PR_NUM" >> "$GITHUB_OUTPUT"
+          echo "Created PR: $PR_URL (#$PR_NUM)"
