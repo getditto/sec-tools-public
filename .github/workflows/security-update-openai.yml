@@ -132,9 +132,14 @@ jobs:
 
       - name: Run OpenAI Codex
         env:
-          OPENAI_API_KEY: ${{ secrets.SEC_OPENAI_KEY }}
+          CODEX_API_KEY: ${{ secrets.SEC_OPENAI_KEY }}
         run: |
           set -o pipefail
+
+          if [ -z "$CODEX_API_KEY" ]; then
+            echo "::error::SEC_OPENAI_KEY is missing or empty."
+            exit 1
+          fi
 
           codex exec \
             --dangerously-bypass-approvals-and-sandbox \
