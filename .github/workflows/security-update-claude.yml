@@ -2,7 +2,7 @@
 # Lives in getditto/sec-tools-public.
 # See TINES_AUTOMATION.md for the full design.
 
-name: 'Security Dependency Update (OpenAI Codex)'
+name: 'Security Dependency Update (Claude Code)'
 
 on:
   workflow_call:
@@ -38,7 +38,7 @@ on:
         required: false
         type: string
     secrets:
-      SEC_OPENAI_KEY:
+      ANTHROPIC_API_KEY:
         required: true
       GH_TOKEN_SECURITY_PATCHES:
         required: true
@@ -51,25 +51,20 @@ jobs:
   generate-security-update-pr:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     outputs:
       pr_number: ${{ steps.create-pr.outputs.pr_number }}
-
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.target_branch || github.ref }}
           token: ${{ secrets.GH_TOKEN_SECURITY_PATCHES }}
-          persist-credentials: false
 
       - uses: actions/setup-node@v6.3.0
         with:
           node-version: 20
 
-      - name: Install OpenAI Codex
-        run: |
-          npm install -g @openai/codex
-          codex --version
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
 
       - name: Generate prompt
         run: |
@@ -130,17 +125,16 @@ jobs:
           9. Do NOT commit. Leave the working tree dirty.
           EOF
 
-      - name: Run OpenAI Codex
+      - name: Run Claude Code
         env:
-          OPENAI_API_KEY: ${{ secrets.SEC_OPENAI_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          set -o pipefail
-
-          codex exec \
-            --dangerously-bypass-approvals-and-sandbox \
-            --json \
-            - < /tmp/security-prompt.txt \
-            | tee /tmp/codex-output.jsonl
+          claude --print \
+            --output-format stream-json \
+            --verbose \
+            --allowedTools "Edit,Read,Glob,Grep,Bash" \
+            --max-turns 100 \
+            "$(cat /tmp/security-prompt.txt)" | tee /tmp/claude-output.log
 
       - name: Stop Gradle daemon
         if: always()
@@ -169,13 +163,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN_SECURITY_PATCHES }}
         run: |
           if [ -z "$(git status --porcelain)" ]; then
-            echo "::error::No changes made. OpenAI Codex could not fix any of the listed vulnerabilities."
+            echo "::error::No changes made. Claude could not fix any of the listed vulnerabilities."
             exit 1
           fi
 
           TARGET="${{ inputs.target_branch || github.ref_name }}"
           BRANCH="security/${{ inputs.batch_id }}-$(echo "$TARGET" | sed 's|/|-|g')"
-
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
@@ -184,10 +177,8 @@ jobs:
           # Capture untracked files left behind (not staged by git add -u)
           UNTRACKED=$(git ls-files --others --exclude-standard)
           UNTRACKED_NOTE=""
-
           if [ -n "$UNTRACKED" ]; then
             UNTRACKED_LIST=$(echo "$UNTRACKED" | sed 's/^/- `/' | sed 's/$/`/')
-
             UNTRACKED_NOTE=$(cat <<UNTRACKED_EOF
 
           ### Untracked files (not included in this PR)
@@ -202,14 +193,13 @@ jobs:
           ALERT_SUMMARY=$(echo '${{ inputs.alerts }}' | jq -r '.[] | "- **\(.package)** → \(.version) (\(.cve))"')
 
           SKIPPED_NOTE=""
-
           if [ -f /tmp/skipped.json ]; then
             SKIPPED_NOTE=$(cat <<SKIP
 
           ### Skipped (needs manual fix)
           $(cat /tmp/skipped.json | jq -r '.[] | "- **\(.package)**: \(.reason)"')
           SKIP
-            )
+          )
           fi
 
           git commit -m "$(cat <<COMMIT_EOF
@@ -219,29 +209,23 @@ jobs:
 
           Refs: ${{ inputs.linear_tickets }}
 
-          Co-Authored-By: OpenAI Codex <noreply@openai.com>
+          Co-Authored-By: Claude <noreply@anthropic.com>
           COMMIT_EOF
           )"
 
-          # Checkout credentials were not persisted while Codex was running.
-          # Configure Git authentication only now, after Codex has exited.
-          gh auth setup-git
           git push -u origin "$BRANCH"
 
           # Build reviewer flags: split comma-separated list into --reviewer flags
           REVIEWER_FLAGS=""
           IFS=',' read -ra REVIEWERS <<< "${{ inputs.reviewers }}"
-
           for r in "${REVIEWERS[@]}"; do
             REVIEWER_FLAGS="$REVIEWER_FLAGS --reviewer $(echo "$r" | xargs)"
           done
 
           # Build label flags from caller-provided labels
           LABEL_FLAGS=""
-
           if [ -n "${{ inputs.pr_labels }}" ]; then
             IFS=',' read -ra LABELS <<< "${{ inputs.pr_labels }}"
-
             for l in "${LABELS[@]}"; do
               LABEL_FLAGS="$LABEL_FLAGS --label $(echo "$l" | xargs)"
             done
@@ -272,7 +256,7 @@ jobs:
           - [ ] No new high/critical vulnerabilities in affected lockfiles
           - [ ] Affected SDK/component builds successfully
 
-          Generated by Tines + OpenAI Codex
+          Generated by Tines + Claude Code
           PR_EOF
           )" \
             --reviewer "@copilot" \
